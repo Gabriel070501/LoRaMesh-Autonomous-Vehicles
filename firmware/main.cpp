@@ -10,6 +10,7 @@
 #define MIN_RANGE            400
 #define MAX_RETX               2
 
+#define PASSWORD_RAM_ADDRESS 0x20000000U
 
 #define BW125                0x00
 #define BW250                0x01
@@ -63,11 +64,59 @@
 #define INPUT_PULLDOWN       8
 #endif
 
+#define NUM_NORMAL_CHANNELS 64
+#define NUM_EXTRA_CHANNELS 8
+#define BASE_NORMAL_FREQ_HZ 902300000  // 902.3 MHz
+#define BASE_EXTRA_FREQ_HZ 901500000   // 915.1 MHz
+#define CHANNEL_SPACING_HZ 200000  
+
+uint32_t normal_channels[3];
+uint32_t extra_channel;
+
+unsigned long last_channel_update = 0;
+const unsigned long CHANNEL_UPDATE_INTERVAL = 5 * 60 * 1000UL; // 5 minutos em ms
+
+uint8_t normal_channel_index = 0;
+
+extern uint32_t _end;
+extern uint32_t _estack;
+
+static uint8_t* next_free = (uint8_t*)&_end;
+
+enum ChannelType { NORMAL, EXTRA };
+ChannelType currentChannelType = NORMAL;
+int currentNormalChannel = 0;
+int currentExtraChannel = 0;
+
+struct SensorData {
+    uint32_t altitude;
+    uint32_t latitude;
+    uint32_t longitude;
+    uint32_t timestamp;
+    uint32_t noise;
+};
+
+void loop() {
+    update_channels_if_needed();
+    updateDynamicId();
+    sendPacket();  
+
+    uint16_t recv_id;
+    uint8_t recv_command;
+    uint8_t recv_payload[MAX_PAYLOAD_SIZE];
+    uint8_t recv_payloadSize;
+
+    bool received = ChannelHop(&recv_id, &recv_command, recv_payload, &recv_payloadSize, 5000);
+    if (received) {
+        // Processa o pacote recebido
+    }
+}
+
 class LoRaMESH{
     private:
         bool analogEnabled = false;
 
-        uint32_t fnv1a_hash(const uint8_t* data, size_t len) {
+    uint32_t fnv1a_hash(const uint8_t* data, size_t len) {
         uint32_t hash = 2166136261UL;
         for (size_t i = 0; i < len; ++i) {
             hash ^= data[i];
@@ -76,21 +125,159 @@ class LoRaMESH{
         return hash;
     }
 
-    void readAnalogPins(uint32_t* altitude, uint32_t* latitude, uint32_t* longitude, uint32_t* timestamp, uint32_t* noise) {
-    // Leitura real
-    
-    // *altitude  = analogRead(localId, 4);
-    // *latitude  = analogRead(localId, 5);
-    // *longitude = analogRead(localId, 6);
-    // *timestamp = analogRead(localId, 7);
-    // *noise     = analogRead(localId, 8);
+    uint32_t pick_random_normal_channel() {
+        int channel = rand() % NUM_NORMAL_CHANNELS;
+        return BASE_NORMAL_FREQ_HZ + (channel * CHANNEL_SPACING_HZ);
+    }
 
-    // Simulação
-    *altitude  = 1234;
-    *latitude  = 2048;
-    *longitude = 1111;
-    *timestamp = 2222;
-    *noise     = 3777;
+    uint32_t pick_random_extra_channel() {
+        int channel = rand() % NUM_EXTRA_CHANNELS;
+        return BASE_EXTRA_FREQ_HZ + (channel * CHANNEL_SPACING_HZ);
+    }
+
+    void update_channels_if_needed() {
+        unsigned long now = millis();
+        if (now - last_channel_update > CHANNEL_UPDATE_INTERVAL || last_channel_update == 0) {
+            for (int i = 0; i < 3; i++) {
+                normal_channels[i] = pick_random_normal_channel();
+            }
+            extra_channel = pick_random_extra_channel();
+            last_channel_update = now;
+            normal_channel_index = 0;
+        }
+        else{
+            return
+        }
+    }
+
+    bool ChannelHop(uint16_t* id, uint8_t* command, uint8_t* payload, uint8_t* payloadSize, uint32_t totalTimeoutMs) {
+        const uint32_t singleAttemptTimeout = 500;
+        uint32_t startTime = millis();
+    
+        while (millis() - startTime < totalTimeoutMs) {
+            uint32_t freq = 0;
+    
+            if (currentChannelType == NORMAL) {
+                freq = BASE_NORMAL_FREQ_HZ + currentNormalChannel * CHANNEL_SPACING_HZ;
+            } else { // EXTRA
+                freq = BASE_EXTRA_FREQ_HZ + currentExtraChannel * CHANNEL_SPACING_HZ;
+            }
+    
+            change_channel(freq);
+    
+            bool received = receivePacketCommand(id, command, payload, payloadSize, singleAttemptTimeout, freq);
+            if (received) {
+                return true;
+            }
+    
+            if (currentChannelType == NORMAL) {
+                currentNormalChannel++;
+                if (currentNormalChannel >= NUM_NORMAL_CHANNELS) {
+                    currentNormalChannel = 0;
+                    currentChannelType = EXTRA;
+                }
+            } else {
+                currentExtraChannel++;
+                if (currentExtraChannel >= NUM_EXTRA_CHANNELS) {
+                    currentExtraChannel = 0;
+                    currentChannelType = NORMAL;
+                }
+            }
+        }
+    
+        return false;
+    }
+
+    uint8_t* getPasswordFromRAM() {
+        return (uint8_t*)PASSWORD_RAM_ADDRESS;
+    }
+
+    void AES_128(uint8_t* input, uint8_t* output, uint32_t tamanho) {
+        struct AES_ctx ctx;
+        uint8_t* chave = getPasswordFromRAM();
+    
+        AES_init_ctx(&ctx, chave);
+    
+        for (uint32_t i = 0; i < tamanho; i += 16) {
+            AES_ECB_encrypt(&ctx, input + i);
+            memcpy(output + i, input + i, 16);
+        }
+
+        return output;
+    }
+
+    void AES_128_decrypt(const uint8_t* input, uint8_t* output, uint32_t length){
+        struct AES_ctx ctx;
+        AES_init_ctx(&ctx, obter_senha_da_ram());
+    
+        for(uint32_t i = 0; i < length; i += 16){
+            memcpy(output + i, input + i, 16);
+            AES_ECB_decrypt(&ctx, output + i);
+        }
+
+        return output
+    }
+
+    uint16_t pick_random_window(uint16_t max_ms) {
+        return (rand() % max_ms) + 1; // de 1 ms até max_ms
+    }
+
+    SensorData getData() {
+        SensorData data;
+    
+        if (SerialData.available() < 16) {
+            data.altitude  = 0;
+            data.latitude  = 0;
+            data.longitude = 0;
+            data.timestamp = 0;
+        } else {
+            data.altitude  = ((uint32_t)SerialData.read())       |
+                             ((uint32_t)SerialData.read() << 8 ) |
+                             ((uint32_t)SerialData.read() << 16) |
+                             ((uint32_t)SerialData.read() << 24);
+    
+            data.latitude  = ((uint32_t)SerialData.read())       |
+                             ((uint32_t)SerialData.read() << 8 ) |
+                             ((uint32_t)SerialData.read() << 16) |
+                             ((uint32_t)SerialData.read() << 24);
+    
+            data.longitude = ((uint32_t)SerialData.read())       |
+                             ((uint32_t)SerialData.read() << 8 ) |
+                             ((uint32_t)SerialData.read() << 16) |
+                             ((uint32_t)SerialData.read() << 24);
+    
+            data.timestamp = ((uint32_t)SerialData.read())       |
+                             ((uint32_t)SerialData.read() << 8 ) |
+                             ((uint32_t)SerialData.read() << 16) |
+                             ((uint32_t)SerialData.read() << 24);
+        }
+    
+        data.noise = analogRead(localId, 8);
+    
+        return data;
+    }
+
+    void updateDynamicId() {
+        uint32_t currentTime = millis();
+        
+        if (currentTime - lastIdUpdateTime >= 300000UL) {
+            lastIdUpdateTime = currentTime;
+    
+            uint32_t altitude, latitude, longitude, timestamp, noise;
+            readSensorData(&altitude, &latitude, &longitude, &timestamp, &noise);
+    
+            uint8_t buffer[12];
+            memcpy(&buffer[0], &latitude, 4);
+            memcpy(&buffer[4], &altitude, 4);
+            memcpy(&buffer[8], &noise,    4);
+    
+            id = fnv1a_hash(buffer, sizeof(buffer));
+            localId = id
+            if (debug_serial) {
+                Serial.print("Novo ID gerado: ");
+                Serial.println(dynamicId, HEX);
+            }
+        }
     }
 
     public:
@@ -151,16 +338,16 @@ class LoRaMESH{
             return (crc_calc&0xFFFF);
         }
 
-        bool prepareFrameCommand(uint16_t id, uint8_t command, uint8_t* payload, uint8_t payloadSize){
+        bool prepareFrameCommand(uint16_t id, uint8_t command, uint8_t* , uint8_t Size){
             if((id < 0)) return false;
             if(command < 0) return false;
-            if(payload < 0) return false;
-            if(payloadSize < 0) return false;
+            if( < 0) return false;
+            if(Size < 0) return false;
             
 
             uint16_t crc = 0;
 
-            frame.size = payloadSize + 5;
+            frame.size = Size + 5;
             
             frame.buffer[0] = id&0xFF;
             frame.buffer[1] = (id>>8)&0xFF;
@@ -186,106 +373,270 @@ class LoRaMESH{
             return sendPacket();
         }
 
-        bool PrepareFrameTransp(uint16_t id, uint8_t* payload, uint8_t payloadSize)
-        {
+        bool PrepareFrameTransp(uint16_t id, uint8_t* payload, uint8_t payloadSize) {
             uint8_t i = 0;
-
+        
             if(payload == NULL) return false;
-            if(id > 1023) return false;
             if(deviceId == -1) return false;
+            if(payloadSize < 19) return false;
+        
+            uint8_t retx_byte_index = 0;
+            if (payloadSize == 23) {
+                retx_byte_index = 20;
+                uint8_t retx_bits = payload[retx_byte_index] & 0x07;
+                if (retx_bits >= MAX_RETX) return false;
+            } else if (payloadSize == 19) {
+                retx_byte_index = 16;
+                uint8_t retx_bits = payload[retx_byte_index] & 0x07;
+                if (retx_bits >= MAX_RETX) return false;
+            }
+        
+            int index = -1;
+            for (int j = 0; j < 4; j++) {
+                if (ids[j] == (uint8_t)id) {
+                    index = j;
+                    break;
+                }
+            }
+        
+            uint32_t payloadTimestamp = 0;
+            if (payloadSize == 23) {
+                payloadTimestamp = 
+                    ((uint32_t)payload[16]) |
+                    ((uint32_t)payload[17] << 8) |
+                    ((uint32_t)payload[18] << 16) |
+                    ((uint32_t)payload[19] << 24);
+            } else if (payloadSize == 19) {
+                payloadTimestamp = 
+                    ((uint32_t)payload[12]) |
+                    ((uint32_t)payload[13] << 8) |
+                    ((uint32_t)payload[14] << 16) |
+                    ((uint32_t)payload[15] << 24);
+            }
+        
+            if (index != -1) {
+                if (payloadTimestamp <= timestamps[index]) {
+                    return false;
+                }
+                timestamps[index] = payloadTimestamp;
+            } else {
+                return true;
+            }
+        
+            uint8_t current_byte = payload[retx_byte_index];
+            uint8_t retx_bits = current_byte & 0x07;
+            retx_bits = (retx_bits + 1) & 0x07;  // incrementa e mantém 3 bits
+            current_byte &= 0xF8;                // limpa bits 0-2
+            current_byte |= retx_bits;           // atualiza bits 0-2
+            payload[retx_byte_index] = current_byte;
+
+            savePayloadOnRAM(payload);
             
             frame.size = payloadSize + 2;
-            frame.buffer[i++] = id&0xFF;
-            frame.buffer[i++] = (id>>8)&0x03;
-            
-            /*
-            if((id != 0) && (deviceId == 0)) 
-            {
-                frame.size = payloadSize + 2;
-                frame.buffer[i++] = id&0xFF;
-                frame.buffer[i++] = (id>>8)&0x03;
-            }
-            else
-            {
-                frame.size = payloadSize;
-            }*/
-            
-            if((payloadSize >= 0) && (payloadSize < MAX_PAYLOAD_SIZE))
-            {
-                /* Loads the payload */
+            frame.buffer[i++] = id & 0xFF;
+            frame.buffer[i++] = (id >> 8) & 0x03;
+        
+            delay(1000);
+        
+            if (payloadSize >= 0 && payloadSize < MAX_PAYLOAD_SIZE) {
                 memcpy(&frame.buffer[i], payload, payloadSize);
-            }
-            else
-            {
-                /* Invalid payload size */
+            } else {
                 memset(&frame.buffer[0], 0, MAX_BUFFER_SIZE);
                 return false;
             }
-
-            frame.command = false;
-            return true;
-        }
-
-        bool sendPacket(){
-            if(frame.size == 0) return false;
-            if(debug_serial)
-            {
-                Serial.print("TX: ");
-                printHex(frame.buffer, frame.size);
-                
+        
+            uint32_t freq_hz = 0;
+            uint16_t window_ms = 0;
+        
+            if (payloadSize == 23) {
+                freq_hz = pick_random_extra_channel();
+                window_ms = pick_random_window(10);  // até 10 ms
+            } else if (payloadSize == 19) {
+                freq_hz = pick_random_normal_channel();
+                window_ms = pick_random_window(40);  // até 40 ms
             }
-
+        
+            change_channel(freq_hz);
+        
+            delay(window_ms);  // espera a janela antes de enviar
+        
+            uint32_t tamanho_cript = ((frame.size + 15) / 16) * 16;
+            uint8_t buffer_cript[tamanho_cript];
+            memset(buffer_cript, 0, tamanho_cript);
+        
+            AES_128(frame.buffer, buffer_cript, tamanho_cript);
+        
+            if(debug_serial) {
+                Serial.print("TX (cript): ");
+                printHex(buffer_cript, tamanho_cript);
+            }
+        
             if(frame.command)
-                SerialLoRa->write(frame.buffer, frame.size);
-            else
+                SerialLoRa->write(buffer_cript, tamanho_cript);
+            else {
                 if(SerialLoRat == NULL)
                     return false;
                 else
-                    SerialLoRat->write(frame.buffer, frame.size);
-
+                    SerialLoRat->write(buffer_cript, tamanho_cript);
+            }
+        
             return true;
         }
 
-        bool receivePacketCommand(uint16_t* id, uint8_t* command, uint8_t* payload, uint8_t* payloadSize, uint32_t timeout){
-            uint16_t waitNextByte = 500;
+        void sendPacket() {
+            static uint32_t lastTransmissionTime = 0;
+            static uint8_t packetCounter = 0;
+        
+            uint32_t currentTime = millis();
+        
+            if (currentTime - lastTransmissionTime >= 1000) {
+                lastTransmissionTime = currentTime;
+        
+                SensorData data = getData();
+        
+                uint8_t hashInput[12];
+                memcpy(&hashInput[0], &data.latitude, 4);
+                memcpy(&hashInput[4], &data.altitude, 4);
+                memcpy(&hashInput[8], &data.noise, 4);
+                uint32_t id = fnv1a_hash(hashInput, 12);
+        
+                uint8_t payload[32];
+                uint8_t index = 0;
+        
+                if (packetCounter < 4) {
+                    memcpy(&payload[index], &id, 4); index += 4;
+                    memcpy(&payload[index], &data.latitude, 4); index += 4;
+                    memcpy(&payload[index], &data.longitude, 4); index += 4;
+                    memcpy(&payload[index], &data.timestamp, 4); index += 4;
+                    payload[index++] = 0x00; // 1 byte vazio
+                } else {
+                    memcpy(&payload[index], &id, 4); index += 4;
+                    memcpy(&payload[index], &data.latitude, 4); index += 4;
+                    memcpy(&payload[index], &data.longitude, 4); index += 4;
+                    memcpy(&payload[index], &data.altitude, 4); index += 4;
+                    memcpy(&payload[index], &data.timestamp, 4); index += 4;
+                    payload[index++] = 0x00; // 1 byte vazio
+                }
+        
+                uint16_t crc = ComputeCRC(payload, index);
+                payload[index++] = crc & 0xFF;
+                payload[index++] = (crc >> 8) & 0xFF;
+        
+                buildFrame(id, payload, index);
+                sendFrameEncrypted();
+        
+                packetCounter = (packetCounter + 1) % 5;
+            }
+        }
+
+        void buildFrame(uint32_t id, uint8_t* payload, uint8_t payloadSize) {
             uint8_t i = 0;
+            frame.size = payloadSize + 2;
+            frame.buffer[i++] = id & 0xFF;
+            frame.buffer[i++] = (id >> 8) & 0x03;
+            memcpy(&frame.buffer[i], payload, payloadSize);
+        }
+
+        bool sendFrameEncrypted() {
+            if (frame.size == 0) return false;
+        
+            uint32_t tamanho_cript = ((frame.size + 15) / 16) * 16;
+            uint8_t buffer_cript[tamanho_cript];
+            memset(buffer_cript, 0, tamanho_cript);
+        
+            AES_128(frame.buffer, buffer_cript, tamanho_cript);
+        
+            if(debug_serial) {
+                Serial.print("TX (cript): ");
+                printHex(buffer_cript, tamanho_cript);
+            }
+        
+            if(frame.command)
+                SerialLoRa->write(buffer_cript, tamanho_cript);
+            else {
+                if(SerialLoRat == NULL)
+                    return false;
+                else
+                    SerialLoRat->write(buffer_cript, tamanho_cript);
+            }
+            return true;
+        }
+
+        void change_channel(uint32_t frequency_hz) {
+           
+            LoRa.setFrequency(frequency_hz / 1e6); // setFrequency usa MHz
+        }
+
+        bool receivePacketCommand(uint16_t* id, uint8_t* command, uint8_t* payload, uint8_t* payloadSize, uint32_t timeout, uint32_t frequency_hz){
+            uint16_t waitNextByte = 500;
+            uint8_t index = 0;
             uint16_t crc = 0;
-
-            if(id < 0x00) return false;
-            if(command < 0x00) return false;
-            if(payload < 0x00) return false;
-            if(payloadSize < 0x00) return false;
-
-            while( ((timeout > 0 ) || (i > 0)) && (waitNextByte > 0) )
+        
+            LoRa.setFrequency(frequency_hz / 1e6); // MHz
+            LoRa.receive();
+        
+            if(id == NULL || command == NULL || payload == NULL || payloadSize == NULL)
+                return false;
+        
+            while(((timeout > 0) || (index > 0)) && (waitNextByte > 0))
             {
                 if(SerialLoRa->available() > 0)
                 {
-                    byte a = SerialLoRa->read();
-                    frame.buffer[i++] = a;
+                    uint8_t byteReceived = SerialLoRa->read();
+                    frame.buffer[index++] = byteReceived;
                     waitNextByte = 200;
                 }
-                
-                if(i > 0){
+                if(index > 0){
                     waitNextByte--;
                 }
                 timeout--;
                 delay(1);
             }
-            
-            if(debug_serial && i > 0){
-                Serial.print("RX: ");
-                printHex(frame.buffer, i);
+        
+            if(debug_serial && index > 0){
+                Serial.print("RX (encrypted): ");
+                printHex(frame.buffer, index);
             }
-
-            if((timeout == 0) && (i == 0)) return false;
-            crc = (uint16_t)frame.buffer[i-2] | ((uint16_t)frame.buffer[i-1] << 8);
-            if(ComputeCRC(&frame.buffer[0], i-2) != crc) return false;
-            *id = (uint16_t)frame.buffer[0] | ((uint16_t)frame.buffer[1] << 8);
-            *command = frame.buffer[2];
-            *payloadSize = i-5;
-            memcpy(payload, &frame.buffer[3], i-5);
-            
+        
+            if((timeout == 0) && (index == 0)) return false;
+        
+            crc = (uint16_t)frame.buffer[index - 2] | ((uint16_t)frame.buffer[index - 1] << 8);
+            if(ComputeCRC(&frame.buffer[0], index - 2) != crc) return false;
+        
+            uint8_t decryptedBuffer[64];
+            memset(decryptedBuffer, 0, sizeof(decryptedBuffer));
+            AES_128_decrypt(frame.buffer, decryptedBuffer, index - 2);
+        
+            *id = (uint16_t)decryptedBuffer[0] | ((uint16_t)decryptedBuffer[1] << 8);
+            *command = decryptedBuffer[2];
+        
+            *payloadSize = payloadSize
+        
+            // Copia o payload descriptografado
+            memcpy(payload, &decryptedBuffer[3], *payloadSize);
+        
+            if(debug_serial){
+                Serial.print("RX (decrypted): ");
+                printHex(payload, *payloadSize);
+            }
+        
+            bool sent = PrepareFrameTransp(*id, payload, *payloadSize);
+            if(!sent) {
+                if(debug_serial) Serial.println("PrepareFrameTransp failed.");
+                return false;
+            }
+        
             return true;
+        }
+
+        void savePayloadOnRAM(uint32_t valor) {
+            if ((uintptr_t)(next_free + sizeof(uint32_t)) < (uintptr_t)&_estack) {
+                *((uint32_t*)next_free) = valor;
+                next_free += sizeof(uint32_t);
+            } else {
+                // RAM cheia — entra em loop infinito ou reinicia
+                while (1);
+            }
         }
 
         bool receivePacketTransp(uint16_t* id, uint8_t* payload, uint8_t* payloadSize, uint32_t timeout)
@@ -293,8 +644,7 @@ class LoRaMESH{
             uint16_t waitNextByte = 500;
             uint8_t i = 0;
             
-            /* Assert parameters */
-            /*
+            
             if((id == NULL) && (deviceId == 0)) return false;
             if(payload == NULL) return false;
             if(payloadSize == NULL) return false;
@@ -317,7 +667,6 @@ class LoRaMESH{
                 delay(1);
             }
 
-            /* In case it didn't get any data */
             if((timeout == 0) && (i == 0)) return false;
 
             if(deviceId == 0)
