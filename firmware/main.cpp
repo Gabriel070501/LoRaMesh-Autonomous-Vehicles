@@ -9,6 +9,8 @@
 
 #define MIN_RANGE            400
 #define MAX_RETX               2
+#define NUM_MAX_RETX          20
+
 
 #define PASSWORD_RAM_ADDRESS 0x20000000U
 
